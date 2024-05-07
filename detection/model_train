@@ -1,0 +1,166 @@
+import os
+import configparser
+from PIL import Image
+
+import torch
+import torch.utils.data.dataset as dataset
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from YOLOS.models.detector import Detector, SetCriterion
+from YOLOS.models.matcher import HungarianMatcher
+from YOLOS.util.misc import collate_fn
+from YOLOS.datasets.coco import ConvertCocoPolysToMask, make_coco_transforms
+
+
+# number of classes in images
+num_classes = 5
+
+#number of detection tokens
+det_token_num = 30
+
+#name of backbone
+backbone_name = 'base'
+
+init_pe_size = (800, 1344)
+mid_pe_size = (800, 1344)
+
+use_checkpoint = False
+
+bbox_loss_coef = 5
+giou_loss_coef = 2
+eos_coef = 0.1
+set_cost_class = 1
+set_cost_bbox =5
+set_cost_giou = 2
+
+path_deit = 'deit_base_distilled_patch16_384-d0272ac0.pth'
+
+#batch size
+batch_size = 1
+
+#%% define yolos model
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+model = Detector(num_classes=num_classes,
+                 pre_trained=path_deit,
+                 det_token_num=det_token_num,
+                 backbone_name=backbone_name,
+                 init_pe_size=init_pe_size,
+                 mid_pe_size=mid_pe_size,
+                 use_checkpoint=use_checkpoint)
+model.to(device)
+
+weight_dict = {'loss_ce':1, 'loss_bbox':bbox_loss_coef, 'loss_giou':giou_loss_coef}
+losses = ['labels', 'boxes', 'cardinality']
+matcher = HungarianMatcher(cost_class=set_cost_class, cost_bbox=set_cost_bbox, cost_giou=set_cost_giou)
+criterion = SetCriterion(num_classes=num_classes,
+                         matcher=matcher,
+                         weight_dict=weight_dict,
+                         eos_coef=eos_coef,
+                         losses=losses)
+criterion.to(device)
+
+n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print('number of parameters:', n_parameters)
+
+#define a custom train_dataset
+dataset_train = SoccerNetDataset(train=True)
+
+#define a custom train_dataloader
+sampler_train = torch.utils.data.RandomSampler(dataset_train)
+batch_sampler_train = torch.utils.data.BatchSampler(sampler_train,
+                                                    batch_size=batch_size,
+                                                    drop_last=True)
+data_loader_train = DataLoader(dataset_train,
+                               batch_sampler=batch_sampler_train,
+                               collate_fn=collate_fn)
+
+#%% prepare for training
+
+#define an optimizer
+def build_optimizer(model, lr=1e-4, weight_decay=1e-4):
+    if hasattr(model.backbone, 'no_weight_decay'):
+        skip = model.backbone.no_weight_decay()
+    head = []
+    backbone_decay = []
+    backbone_no_decay = []
+    for name, param in model.named_parameters():
+        if "backbone" not in name and param.requires_grad:
+            head.append(param)
+        if "backbone" in name and param.requires_grad:
+            if len(param.shape) == 1 or name.endswith(".bias") or name.split('.')[-1] in skip:
+                backbone_no_decay.append(param)
+            else:
+                backbone_decay.append(param)
+    param_dicts = [
+        {"params": head},
+        {"params": backbone_no_decay, "weight_decay": 0., "lr": lr},
+        {"params": backbone_decay, "lr": lr},
+    ]
+    optimizer = torch.optim.AdamW(param_dicts,
+                                  lr=lr,
+                                  weight_decay=weight_decay)
+    return optimizer
+
+optimizer = build_optimizer(model=model, lr=2.5e-5)
+
+#define a lr_scheduler
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+
+#max_norm for gradient clippping
+max_norm = 10.0
+
+
+#%% begin training!
+
+print('start training! from epoch 11')
+
+for epoch in range(1, 11):
+    print("Epoch:", epoch)
+    model.train()
+    criterion.train()
+
+    running_loss = 0.0
+    cardinality_error = 0
+    cross_entropy_loss = 0
+    giou_loss = 0
+    bbox_loss = 0
+
+    for idx, (samples, targets) in enumerate(tqdm(data_loader_train)):
+        samples = samples.to(device)
+        targets = [{k: v.to(device) for k,v in t.items()} for t in targets]
+
+        outputs = model(samples)
+        loss_dict = criterion(outputs, targets)
+        weight_dict = criterion.weight_dict
+        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+
+        optimizer.zero_grad()
+        losses.backward()
+        if max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        optimizer.step()
+
+        running_loss += losses.item()
+        cardinality_error += loss_dict['cardinality_error'].item()
+        cross_entropy_loss += loss_dict['loss_ce'].item()
+        giou_loss += loss_dict['loss_giou'].item()
+        bbox_loss += loss_dict['loss_bbox'].item()
+
+        if (idx+1)%100 == 0:
+            print(f'step: {(idx+1)//100}, loss : {running_loss/100:.2f}, cardinality error :{cardinality_error/100:.0f}, ce_loss: {cross_entropy_loss/100:.2f}, giou_loss: {giou_loss/100:.2f}, bbox_loss: {bbox_loss/100:.2f}')
+            running_loss = 0
+            cardinality_error = 0
+            cross_entropy_loss = 0
+            giou_loss = 0
+            bbox_loss = 0
+
+    lr_scheduler.step()
+
+    if epoch % 1 == 0:
+        PATH = 'data/yolos' + str(epoch) + 'model.pt'
+        torch.save(model, PATH)
+
+print('training is done!')
