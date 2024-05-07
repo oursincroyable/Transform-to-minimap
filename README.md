@@ -5,4 +5,4 @@ Transform a football broadcast image to a minimap version.
 
 ![mwd2](https://github.com/oursincroyable/Transform-to-minimap/assets/168544086/7aee07cb-e775-470c-8d6c-b0f403efca6c)
 
-blue, white : field players, yellow: goalkeepers, green: refereers, red: balls
+Run example.py to transform an image to its minimap version.
