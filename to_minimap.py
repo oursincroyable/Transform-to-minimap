@@ -8,7 +8,11 @@ import torch
 import torchvision.transforms as transforms
 
 class To_Minimap():
-
+    '''
+    field_image_path : path to worldcup_field_model.png,
+    path_DPT : path to a trained DPT model for football field registration,
+    path_YOLOS : path to a trained YOLOS model for players detection.
+    '''
     def __init__(self,field_image_path = 'KpSFR/assets/worldcup_field_model.png',
                  path_DPT='KpSFR/dataset/0409DPT8model.pt',
                  path_YOLOS='yolos10model.pt'):
@@ -62,8 +66,8 @@ class To_Minimap():
         image = transforms.Resize((480, 480), interpolation=transforms.InterpolationMode.BICUBIC)(image)
         return image.unsqueeze(dim=0)
 
+    # run DPT model to obtain keypoints detection
     def _predict_keypoints(self, image):
-
 
         input = self._preprocess_DPT(image)
         input.to(self.device)
@@ -179,7 +183,8 @@ class To_Minimap():
                     image_players.append(
                         np.mean(np.mean(image[int(ymin):int(ymax), int(xmin):int(xmax)], axis=0), axis=0))
                     coord_players.append([(xmin + xmax) / 2, ymax, 1])
-
+                    
+        #apply k-means algorithm for classify players into two teams based on colors 
         kmeans = KMeans(n_clusters=2, random_state=0)
         kmeans.fit(image_players)
         label_players = kmeans.labels_
@@ -195,7 +200,7 @@ class To_Minimap():
         color += color_players
 
         return coord, color
-
+    
     def to_minimap_with_detection(self, image):
 
         coord, color = self._to_coordinates(image)
